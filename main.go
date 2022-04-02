@@ -225,6 +225,7 @@ func fetchPrice(id, path, date string, timestamp int) {
 		return
 	}
 
+	fmt.Println(isToday(date))
 	// if bitcoin values goes above max or go below min and requested date is of today then send email
 	if bitcoin.MarketData.CurrentPrice.USD < float64(min) && isToday(date) {
 		go sendEmail(bitcoin.MarketData.CurrentPrice.USD, fmt.Sprintf("Price of bitcoin went below %d", min))
