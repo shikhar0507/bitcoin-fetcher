@@ -1,4 +1,4 @@
-FROM golang:1.16-alpine
+FROM golang:1.17-alpine
 # Set destination for COPY
 RUN apk update
 RUN apk add --virtual build-dependencies  build-base gcc

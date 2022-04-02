@@ -7,24 +7,48 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/smtp"
 	"os"
+	"strconv"
+	"strings"
 	"thinklink/utils"
 	"time"
 
+	// "github.com/joho/godotenv"
 	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var database *sql.DB
+var (
+	database *sql.DB
+	min      int
+	max      int
+	host     string = "http://localhost:8080"
+	email    Email
+)
 
+type Email struct {
+	from, body string
+	to         []string
+}
 type Bitcoin struct {
 	MarketData struct {
 		CurrentPrice struct {
-			USD int `json:"usd"`
+			USD float64 `json:"usd"`
 		} `json:"current_price"`
 	} `json:"market_data"`
 }
 
+func init() {
+	// err := godotenv.Load()
+	// if err != nil {
+	// 	log.Fatal("Error loading .env file")
+	// }
+	email.from = os.Getenv("from")
+	email.to = []string{os.Getenv("email")}
+	min, _ = strconv.Atoi(os.Getenv("min"))
+	max, _ = strconv.Atoi(os.Getenv("max"))
+}
 func main() {
 	os.Remove("database.db")
 
@@ -46,24 +70,27 @@ func main() {
 		//start a new timer ticker which runs every 30 seconds
 		// A goroutine is created to fetch BTC Prices and update the PRICES Table
 
-		ticker := time.NewTicker(time.Second * 3)
+		ticker := time.NewTicker(time.Second * 30)
 		for {
 			select {
 			case <-ticker.C:
-				go fetchPrice()
-
+				go fetchPrice("bitcoin", "", time.Now().Format("02-01-2006"), int(time.Now().UnixMilli()))
 			}
 		}
 	}()
 
 	http.HandleFunc("/api/prices/btc", handleRequest)
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		utils.SendErrorResponseToClient(w, http.StatusNotFound, "Requested path is not found")
+	})
 	log.Fatal(http.ListenAndServe(":8080", nil))
 
 }
 
 type PriceRow struct {
 	Timestamp int
-	Price     int
+	Price     float64
 	Coin      string
 }
 type PriceResponse struct {
@@ -78,22 +105,38 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	case http.MethodOptions:
 		utils.HandleOptions(w, fmt.Sprintf("%s", http.MethodGet))
 	case http.MethodGet:
-		date, limit, offset := r.URL.Query().Get("date"), r.URL.Query().Get("limit"), r.URL.Query().Get("offset")
-		fmt.Println("start request")
+		date := r.URL.Query().Get("date")
+
+		// validate query params
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil {
+			utils.SendErrorResponseToClient(w, http.StatusBadRequest, "Unable to parse limit")
+			return
+		}
+		offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+		if err != nil {
+			utils.SendErrorResponseToClient(w, http.StatusBadRequest, "Unable to parse offset")
+			return
+		}
 		utcDate, err := time.Parse("02-01-2006", date)
 		if err != nil {
 			utils.SendErrorResponseToClient(w, http.StatusBadRequest, "Unable to parse date")
 			return
 		}
+		var count int
+		err = database.QueryRow("SELECT count(*) as count from prices where `date` = ?", date).Scan(&count)
 
-		if limit == "" {
-			limit = "100"
+		if err != nil {
+			log.Println(err)
 		}
-		if offset == "" {
-			offset = "0"
+		// if date in query param is older fetch records and store in db then send response
+		if count == 0 {
+			fetchPrice("bitcoin", fmt.Sprintf("/history?date=%s", date), date, int(utcDate.UnixMilli()))
+			//count is increased since getting data from history path returns 1 price
+			count = 1
 		}
 
-		rows, err := database.Query("SELECT timestamp,name,price,currency FROM prices where timestamp > ? LIMIT ? OFFSET ?", utcDate.UnixMilli(), limit, offset)
+		rows, err := database.Query("SELECT timestamp,name,price,currency FROM prices where `date` = ? LIMIT ? OFFSET ?", date, limit, offset)
 
 		if err != nil {
 			utils.SendErrorResponseToClient(w, http.StatusInternalServerError, "Try again later")
@@ -101,10 +144,14 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		defer rows.Close()
 		priceResponse := PriceResponse{
-			Data: make([]PriceRow, 0),
+			Data:  make([]PriceRow, 0),
+			Count: count,
+			Url:   host + r.URL.String(),
+			Next:  fmt.Sprintf("%s/api/prices/btc?date=%s&offset=%d&limit=%d", host, date, offset+limit, limit),
 		}
 		for rows.Next() {
-			var timestamp, price int
+			var timestamp int
+			var price float64
 			var name, currency string
 			rows.Scan(&timestamp, &name, &price, &currency)
 			row := PriceRow{
@@ -123,8 +170,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 func setupTables() {
 	sql := `CREATE TABLE prices(
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
 	price REAL NOT NULL,
-	timestamp INTEGER  NOT NULL,
+	date TEXT  NOT NULL,
+	timestamp INTEGER NOT NULL,
 	currency TEXT NOT NULL,
 	name TEXT NOT NULL
 	)`
@@ -147,8 +196,11 @@ func getError(err error) sqlite3.Error {
 	return sqlite3.Error{}
 }
 
-func fetchPrice() {
-	resp, err := http.Get("https://api.coingecko.com/api/v3/coins/bitcoin")
+// fetchPrice calls the external api based on id and path,
+// either today's data is fetched or any historical data.
+
+func fetchPrice(id, path, date string, timestamp int) {
+	resp, err := http.Get(fmt.Sprintf("https://api.coingecko.com/api/v3/coins/%s%s", id, path))
 	if err != nil {
 		log.Println(err)
 		return
@@ -161,84 +213,57 @@ func fetchPrice() {
 		return
 	}
 	err = json.Unmarshal(byteData, &bitcoin)
-
 	if err != nil {
-		log.Println("Failed to parse json")
+		log.Println("Failed to parse json", err)
+		return
 	}
-	statement, err := database.Prepare("INSERT INTO prices(price,timestamp,currency,name) VALUES(?,?,?,?)")
+
+	// if bitcoin values goes above max or go below min then send email
+	if bitcoin.MarketData.CurrentPrice.USD < float64(min) {
+		go sendEmail(bitcoin.MarketData.CurrentPrice.USD, fmt.Sprintf("Price of bitcoin went below %d", min))
+	}
+	if bitcoin.MarketData.CurrentPrice.USD > float64(max) {
+		go sendEmail(bitcoin.MarketData.CurrentPrice.USD, fmt.Sprintf("Price of bitcoin went above %d", max))
+	}
+	statement, err := database.Prepare("INSERT INTO prices(price,date,currency,name,timestamp) VALUES(?,?,?,?,?)")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	_, err = statement.Exec(bitcoin.MarketData.CurrentPrice.USD, date, "usd", "bitcoin", timestamp)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+}
+
+func sendEmail(price float64, message string) {
+
+	user := os.Getenv("username")
+	password := os.Getenv("password")
+
+	addr := fmt.Sprintf("%s:%s", os.Getenv("host"), os.Getenv("port"))
+	host := os.Getenv("host")
+
+	email.body = message
+
+	auth := smtp.PlainAuth("", user, password, host)
+	err := smtp.SendMail(addr, auth, email.from, email.to, []byte(createHTMLMessage(email)))
+
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	_, err = statement.Exec(bitcoin.MarketData.CurrentPrice.USD, time.Now().UnixMilli(), "usd", "bitcoin")
-	if err != nil {
-		// log.Fatal(err)
-		fmt.Println(getError(err).Code, sqlite3.ErrConstraint)
-	}
+	fmt.Println("Email sent successfully")
 
 }
 
-func getPrices() {
+func createHTMLMessage(email Email) string {
+	msg := "MIME-version: 1.0;\nContent-Type: text/html; charset=\"UTF-8\";\r\n"
+	msg += fmt.Sprintf("From: %s\r\n", email.from)
+	msg += fmt.Sprintf("To: %s\r\n", strings.Join(email.to, ";"))
+	msg += fmt.Sprintf("\r\n%s\r\n", email.body)
 
-	rows, err := database.Query("select currency,timestamp,price from prices")
-
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var c *string
-		var r *int
-		var t *int
-		rows.Scan(&c, &t, &r)
-		fmt.Println(*c, *t, *r)
-	}
-}
-
-func createTable(db *sql.DB) {
-	createStudentTableSQL := `CREATE TABLE student (
-		"idStudent" integer NOT NULL PRIMARY KEY AUTOINCREMENT,		
-		"code" TEXT,
-		"name" TEXT,
-		"program" TEXT		
-	  );` // SQL Statement for Create Table
-
-	log.Println("Create student table...")
-	statement, err := db.Prepare(createStudentTableSQL) // Prepare SQL Statement
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	statement.Exec() // Execute SQL Statements
-	log.Println("student table created")
-}
-
-// We are passing db reference connection from main to our method with other parameters
-func insertStudent(db *sql.DB, code string, name string, program string) {
-	log.Println("Inserting student record ...")
-	insertStudentSQL := `INSERT INTO student(code, name, program) VALUES (?, ?, ?)`
-	statement, err := db.Prepare(insertStudentSQL) // Prepare statement.
-	// This is good to avoid SQL injections
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
-	_, err = statement.Exec(code, name, program)
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
-}
-
-func displayStudents(db *sql.DB) {
-	row, err := db.Query("SELECT * FROM student ORDER BY name")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer row.Close()
-	for row.Next() { // Iterate and fetch the records from result cursor
-		var id int
-		var code string
-		var name string
-		var program string
-		row.Scan(&id, &code, &name, &program)
-		log.Println("Student: ", code, " ", name, " ", program)
-	}
+	return msg
 }
