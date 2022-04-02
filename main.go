@@ -197,7 +197,7 @@ func getError(err error) sqlite3.Error {
 }
 
 func isToday(date string) bool {
-	dp, _ := time.Parse("01-02-2006", date)
+	dp, _ := time.Parse("02-01-2006", date)
 	today := time.Now()
 	year, month, day := dp.Date()
 	return year == today.Year() && month == today.Month() && day == today.Day()
