@@ -196,6 +196,13 @@ func getError(err error) sqlite3.Error {
 	return sqlite3.Error{}
 }
 
+func isToday(date string) bool {
+	dp, _ := time.Parse("01-02-2006", date)
+	today := time.Now()
+	year, month, day := dp.Date()
+	return year == today.Year() && month == today.Month() && day == today.Day()
+}
+
 // fetchPrice calls the external api based on id and path,
 // either today's data is fetched or any historical data.
 
@@ -218,11 +225,11 @@ func fetchPrice(id, path, date string, timestamp int) {
 		return
 	}
 
-	// if bitcoin values goes above max or go below min then send email
-	if bitcoin.MarketData.CurrentPrice.USD < float64(min) {
+	// if bitcoin values goes above max or go below min and requested date is of today then send email
+	if bitcoin.MarketData.CurrentPrice.USD < float64(min) && isToday(date) {
 		go sendEmail(bitcoin.MarketData.CurrentPrice.USD, fmt.Sprintf("Price of bitcoin went below %d", min))
 	}
-	if bitcoin.MarketData.CurrentPrice.USD > float64(max) {
+	if bitcoin.MarketData.CurrentPrice.USD > float64(max) && isToday(date) {
 		go sendEmail(bitcoin.MarketData.CurrentPrice.USD, fmt.Sprintf("Price of bitcoin went above %d", max))
 	}
 	statement, err := database.Prepare("INSERT INTO prices(price,date,currency,name,timestamp) VALUES(?,?,?,?,?)")
@@ -235,7 +242,7 @@ func fetchPrice(id, path, date string, timestamp int) {
 		log.Println(err)
 		return
 	}
-
+	fmt.Println("Added price")
 }
 
 func sendEmail(price float64, message string) {
